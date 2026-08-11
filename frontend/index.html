@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agente de Documentos</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <aside class="panel panel-docs">
+    <div class="brand">
+      <span class="brand-mark">§</span>
+      <div>
+        <h1>Agente de Documentos</h1>
+        <p class="subtitle">Envie um PDF e converse com ele</p>
+      </div>
+    </div>
+
+    <label class="dropzone" id="dropzone" for="file-input">
+      <input type="file" id="file-input" accept="application/pdf" multiple hidden>
+      <span class="dropzone-icon">⇧</span>
+      <span class="dropzone-text">Solte PDFs aqui ou clique para escolher</span>
+      <span class="dropzone-hint">Aceita vários arquivos · qualquer tamanho</span>
+    </label>
+
+    <button id="index-btn" class="btn-primary" disabled>Indexar documentos</button>
+
+    <div id="file-list" class="file-list"></div>
+
+    <div id="index-status" class="index-status"></div>
+  </aside>
+
+  <main class="panel panel-chat">
+    <div id="messages" class="messages">
+      <div class="message message-system">
+        Envie um ou mais PDFs ao lado e clique em <strong>Indexar documentos</strong>.
+        Depois, pergunte qualquer coisa sobre o conteúdo aqui.
+      </div>
+    </div>
+
+    <form id="chat-form" class="chat-form">
+      <input
+        type="text"
+        id="chat-input"
+        placeholder="Pergunte algo sobre o documento..."
+        autocomplete="off"
+        disabled
+      >
+      <button type="submit" id="send-btn" disabled>Enviar</button>
+    </form>
+  </main>
+
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
