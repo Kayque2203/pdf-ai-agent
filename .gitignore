@@ -1,25 +1,15 @@
-﻿# Python
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Ambiente virtual
+# Ambiente virtual Python
 venv/
-.venv/
-env/
+__pycache__/
+*.pyc
 
-# Variáveis de ambiente
+# Segredos e variáveis de ambiente
 .env
-.env.*
-!.env.example
 
-# IDE
-.vscode/
-.idea/
+# Certificados gerados (específicos da rede de cada pessoa/empresa)
+backend/combined_cert.pem
+backend/corporativo*.cer
 
-# Sistema
+# Arquivos de sistema
 .DS_Store
 Thumbs.db
-
-# Node
-node_modules/
