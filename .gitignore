@@ -10,6 +10,9 @@ __pycache__/
 backend/combined_cert.pem
 backend/corporativo*.cer
 
+# Índice de busca salvo em disco (gerado localmente, específico de cada uso)
+backend/faiss_index/
+
 # Arquivos de sistema
 .DS_Store
 Thumbs.db

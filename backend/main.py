@@ -46,6 +46,13 @@ def health():
     return {"status": "ok", **rag_agent.status_indice()}
 
 
+@app.post("/reset")
+def reset():
+    """Apaga o índice atual (memória + disco), para indexar outro PDF do zero."""
+    rag_agent.limpar_indice()
+    return {"ok": True}
+
+
 @app.post("/upload")
 async def upload_pdfs(files: List[UploadFile] = File(...)):
     """Recebe um ou mais PDFs, salva e reconstrói o índice de busca (RAG)."""

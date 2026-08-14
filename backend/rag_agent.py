@@ -6,8 +6,11 @@ RAG sobre PDFs + LangGraph), só que organizada como um módulo Python normal,
 para poder ser chamada por uma API (main.py) em vez de rodar célula por célula.
 """
 
-import os
+import time
 import re
+import os
+import json
+import shutil
 import pathlib
 from pathlib import Path
 from collections import Counter
@@ -120,6 +123,11 @@ document_chain = create_stuff_documents_chain(llm_triagem, prompt_rag)
 _retriever = None
 _indexed_files: List[str] = []
 
+# Pasta onde o índice fica salvo em disco, para não precisar reindexar (e
+# gastar cota da API de novo) toda vez que o servidor reiniciar.
+_INDEX_DIR = Path(__file__).resolve().parent / "faiss_index"
+_INDEX_META_PATH = _INDEX_DIR / "arquivos_indexados.json"
+
 
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
@@ -156,6 +164,53 @@ def formatar_citacoes(docs_rel: List, query: str) -> List[Dict]:
     return cites
 
 
+def _salvar_indice(vectorstore, nomes_arquivos: List[str]) -> None:
+    """Salva o índice em disco para poder ser recarregado sem gastar cota de novo."""
+    try:
+        _INDEX_DIR.mkdir(exist_ok=True)
+        vectorstore.save_local(str(_INDEX_DIR))
+        _INDEX_META_PATH.write_text(json.dumps(nomes_arquivos), encoding="utf-8")
+        print(f"[DEBUG] Índice salvo em disco ({len(nomes_arquivos)} arquivo(s)).")
+    except Exception as e:
+        # Não é crítico se falhar ao salvar — o app continua funcionando,
+        # só não vai persistir entre reinicializações.
+        print(f"[DEBUG] Não foi possível salvar o índice em disco: {e}")
+
+
+def _carregar_indice_salvo() -> None:
+    """Tenta carregar um índice salvo anteriormente, ao iniciar o servidor."""
+    global _retriever, _indexed_files
+    if not _INDEX_DIR.exists():
+        return
+    try:
+        vectorstore = FAISS.load_local(
+            str(_INDEX_DIR), embeddings, allow_dangerous_deserialization=True
+        )
+        _retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
+        if _INDEX_META_PATH.exists():
+            _indexed_files = json.loads(_INDEX_META_PATH.read_text(encoding="utf-8"))
+        print(f"[DEBUG] Índice carregado do disco: {_indexed_files}")
+    except Exception as e:
+        print(f"[DEBUG] Não havia índice salvo válido para carregar: {e}")
+
+
+def limpar_indice() -> None:
+    """Remove o índice salvo em disco e da memória (útil para começar do zero)."""
+    global _retriever, _indexed_files
+    _retriever = None
+    _indexed_files = []
+    if _INDEX_DIR.exists():
+        shutil.rmtree(_INDEX_DIR, ignore_errors=True)
+
+
+def _extrair_tempo_espera(erro: Exception) -> float:
+    """Tenta extrair o 'retry_delay' sugerido pela API do Gemini na mensagem de erro."""
+    match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(erro))
+    if match:
+        return float(match.group(1)) + 3  # margem de segurança
+    return 30.0  # fallback se não conseguir extrair
+
+
 def indexar_pdfs(caminhos: List[Path]) -> dict:
     """Carrega os PDFs informados, gera embeddings e (re)constrói o índice FAISS."""
     global _retriever, _indexed_files
@@ -174,13 +229,58 @@ def indexar_pdfs(caminhos: List[Path]) -> dict:
     if not docs:
         return {"ok": False, "detalhe": "Nenhum PDF pôde ser lido.", "arquivos": carregados}
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1800, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
     chunks = [d for d in chunks if isinstance(d, Document)]
 
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+    # Gera embeddings em lotes pequenos. Se a API reclamar de limite de
+    # requisições (erro 429), espera o tempo sugerido por ela e tenta de
+    # novo em vez de desistir — comum em PDFs grandes na camada gratuita.
+    TAMANHO_LOTE = 80
+    MAX_TENTATIVAS_POR_LOTE = 6
+    vectorstore = None
+    total = len(chunks)
+
+    try:
+        for i in range(0, total, TAMANHO_LOTE):
+            lote = chunks[i : i + TAMANHO_LOTE]
+            print(f"[DEBUG] indexando lote {i}-{i+len(lote)} de {total} chunks...")
+
+            tentativa = 0
+            while True:
+                try:
+                    if vectorstore is None:
+                        vectorstore = FAISS.from_documents(lote, embeddings)
+                    else:
+                        vectorstore.add_documents(lote)
+                    break
+                except Exception as e:
+                    tentativa += 1
+                    limite_excedido = "429" in str(e) or "quota" in str(e).lower()
+                    if not limite_excedido or tentativa > MAX_TENTATIVAS_POR_LOTE:
+                        raise
+                    espera = _extrair_tempo_espera(e)
+                    print(
+                        f"[DEBUG] Limite de requisições atingido. Aguardando "
+                        f"{espera:.0f}s antes de tentar de novo (tentativa {tentativa})..."
+                    )
+                    time.sleep(espera)
+
+            if i + TAMANHO_LOTE < total:
+                time.sleep(2)
+    except Exception as e:
+        return {
+            "ok": False,
+            "detalhe": (
+                f"Falha ao gerar embeddings ({e.__class__.__name__}: {e}). "
+                f"Tente novamente em alguns instantes ou envie o PDF em partes menores."
+            ),
+            "arquivos": carregados,
+        }
+
     _retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
     _indexed_files = [c.name for c in caminhos]
+    _salvar_indice(vectorstore, _indexed_files)
 
     contagem = Counter(pathlib.Path(d.metadata.get("source", "")).name for d in chunks)
 
@@ -226,6 +326,11 @@ def status_indice() -> dict:
     return {"indexado": _retriever is not None, "arquivos": _indexed_files}
 
 
+# Tenta recarregar um índice salvo de uma execução anterior, assim o app não
+# perde o PDF indexado toda vez que o servidor reinicia (economiza cota).
+_carregar_indice_salvo()
+
+
 # ---------------------------------------------------------------------------
 # 4. Orquestração com LangGraph (triagem -> RAG -> pedir info / abrir chamado)
 # ---------------------------------------------------------------------------
@@ -245,78 +350,41 @@ def node_triagem(state: AgentState) -> AgentState:
 
 def node_auto_resolver(state: AgentState) -> AgentState:
     resposta_rag = perguntar_rag(state["pergunta"])
-    update: AgentState = {
-        "resposta": resposta_rag["answer"],
-        "citacoes": resposta_rag.get("citacoes", []),
-        "rag_sucesso": resposta_rag["contexto_encontrado"],
-    }
     if resposta_rag["contexto_encontrado"]:
-        update["acao_final"] = "AUTO_RESOLVER"
-    return update
-
-
-def node_pedir_info(state: AgentState) -> AgentState:
-    faltantes = state["triagem"].get("campos_faltantes", [])
-    detalhe = ", ".join(faltantes) if faltantes else "tema e contexto específico"
+        return {
+            "resposta": resposta_rag["answer"],
+            "citacoes": resposta_rag.get("citacoes", []),
+            "rag_sucesso": True,
+            "acao_final": "AUTO_RESOLVER",
+        }
     return {
-        "resposta": f"Para avançar, preciso que detalhe: {detalhe}",
+        "resposta": (
+            "Não encontrei essa informação no documento indexado. "
+            "Tente reformular a pergunta, ou confirme se o PDF certo foi carregado."
+        ),
         "citacoes": [],
-        "acao_final": "PEDIR_INFO",
+        "rag_sucesso": False,
+        "acao_final": "SEM_CONTEXTO",
     }
-
-
-def node_abrir_chamado(state: AgentState) -> AgentState:
-    t = state["triagem"]
-    return {
-        "resposta": f"Abrindo chamado com urgência {t['urgencia']}. Descrição: {state['pergunta'][:140]}",
-        "citacoes": [],
-        "acao_final": "ABRIR_CHAMADO",
-    }
-
-
-def decidir_pos_auto_resolver(state: AgentState) -> str:
-    if state.get("rag_sucesso"):
-        return "ok"
-    return "precisa_triagem"
-
-
-def decidir_pos_triagem(state: AgentState) -> str:
-    decisao = state["triagem"]["decisao"]
-    if decisao == "ABRIR_CHAMADO":
-        return "chamado"
-    return "info"
 
 
 _workflow = StateGraph(AgentState)
-_workflow.add_node("triagem", node_triagem)
 _workflow.add_node("auto_resolver", node_auto_resolver)
-_workflow.add_node("pedir_info", node_pedir_info)
-_workflow.add_node("abrir_chamado", node_abrir_chamado)
 
-# Tenta responder com base no(s) PDF(s) indexado(s) primeiro. Só passa pela
-# triagem (pedir mais informações / abrir chamado) se o RAG não encontrar
-# nada relevante no documento.
+# Fluxo simples: sempre tenta responder com base no(s) PDF(s) indexado(s).
+# Se não achar nada relevante, avisa claramente em vez de inventar ou pedir
+# detalhes confusos (evita respostas estranhas em perguntas fora do escopo).
 _workflow.add_edge(START, "auto_resolver")
-_workflow.add_conditional_edges("auto_resolver", decidir_pos_auto_resolver, {
-    "ok": END,
-    "precisa_triagem": "triagem",
-})
-_workflow.add_conditional_edges("triagem", decidir_pos_triagem, {
-    "info": "pedir_info",
-    "chamado": "abrir_chamado",
-})
-_workflow.add_edge("pedir_info", END)
-_workflow.add_edge("abrir_chamado", END)
+_workflow.add_edge("auto_resolver", END)
 
 grafo = _workflow.compile()
 
 
 def perguntar_agente(pergunta: str) -> dict:
-    """Ponto de entrada único usado pela API: roda triagem + RAG + decisão."""
+    """Ponto de entrada único usado pela API: roda o RAG e retorna a resposta."""
     resultado = grafo.invoke({"pergunta": pergunta})
     return {
         "resposta": resultado.get("resposta"),
         "citacoes": resultado.get("citacoes", []),
         "acao_final": resultado.get("acao_final"),
-        "triagem": resultado.get("triagem", {}),
     }
