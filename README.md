@@ -139,3 +139,10 @@ O `rag_agent.py` já detecta automaticamente o arquivo `combined_cert.pem` (se e
 ## Licença
 
 Uso interno / educacional. Adapte livremente conforme a necessidade do seu time.
+
+
+## Ativar a IA
+
+- venv\Scripts\activate
+
+- python -m uvicorn main:app --port 8000

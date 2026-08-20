@@ -101,6 +101,30 @@ body {
   color: #7b7768;
 }
 
+.url-input-row {
+  display: flex;
+}
+
+#url-input {
+  flex: 1;
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  border: 1px solid #4a5266;
+  background: rgba(255,255,255,0.03);
+  color: #e9e6dd;
+  font-family: 'Inter', sans-serif;
+  font-size: 12.5px;
+}
+
+#url-input::placeholder {
+  color: #7b7768;
+}
+
+#url-input:focus {
+  outline: none;
+  border-color: var(--brass);
+}
+
 .btn-primary {
   background: var(--brass);
   color: #1c1509;

@@ -6,6 +6,7 @@ const indexBtn = document.getElementById("index-btn");
 const fileListEl = document.getElementById("file-list");
 const indexStatusEl = document.getElementById("index-status");
 const resetBtn = document.getElementById("reset-btn");
+const urlInput = document.getElementById("url-input");
 
 const chatForm = document.getElementById("chat-form");
 const chatInput = document.getElementById("chat-input");
@@ -45,9 +46,11 @@ resetBtn?.addEventListener("click", async () => {
   chatInput.disabled = true;
   sendBtn.disabled = true;
   selectedFiles = [];
+  conversationHistory = [];
+  urlInput.value = "";
   renderFileList();
   indexBtn.disabled = true;
-  addMessage("system", "Índice apagado. Envie um novo PDF para indexar.");
+  addMessage("system", "Índice apagado. Envie um novo conteúdo para indexar.");
 });
 
 checarIndiceExistente();
@@ -76,21 +79,35 @@ dropzone.addEventListener("drop", (e) => {
   addFiles(e.dataTransfer.files);
 });
 
+const EXTENSOES_ACEITAS = [".pdf", ".docx", ".txt", ".md", ".csv", ".xlsx", ".xls"];
+
+function temExtensaoAceita(nomeArquivo) {
+  const nome = nomeArquivo.toLowerCase();
+  return EXTENSOES_ACEITAS.some(ext => nome.endsWith(ext));
+}
+
 function addFiles(fileListRaw) {
   const todos = Array.from(fileListRaw);
-  const novos = todos.filter(f => f.type === "application/pdf");
-  const rejeitados = todos.filter(f => f.type !== "application/pdf");
+  const novos = todos.filter(f => temExtensaoAceita(f.name));
+  const rejeitados = todos.filter(f => !temExtensaoAceita(f.name));
 
   selectedFiles = [...selectedFiles, ...novos];
   renderFileList();
-  indexBtn.disabled = selectedFiles.length === 0;
+  atualizarEstadoBotaoIndexar();
 
   if (rejeitados.length > 0) {
     indexStatusEl.className = "index-status error";
     const nomes = rejeitados.map(f => f.name).join(", ");
-    indexStatusEl.textContent = `Ignorado (não é PDF): ${nomes}`;
+    indexStatusEl.textContent = `Ignorado (tipo não suportado): ${nomes}`;
   }
 }
+
+function atualizarEstadoBotaoIndexar() {
+  const temLink = urlInput.value.trim().length > 0;
+  indexBtn.disabled = selectedFiles.length === 0 && !temLink;
+}
+
+urlInput.addEventListener("input", atualizarEstadoBotaoIndexar);
 
 function renderFileList() {
   fileListEl.innerHTML = "";
@@ -110,42 +127,80 @@ function formatBytes(bytes) {
 
 // ---------- Upload / indexação ----------
 
+let progressoIntervalId = null;
+
+function pararPolling() {
+  if (progressoIntervalId) {
+    clearInterval(progressoIntervalId);
+    progressoIntervalId = null;
+  }
+}
+
+function iniciarPollingDeProgresso() {
+  pararPolling();
+  progressoIntervalId = setInterval(async () => {
+    try {
+      const res = await fetch(`${API_URL}/upload-progress`);
+      const p = await res.json();
+      if (!p.em_andamento) return;
+
+      let texto = p.mensagem || "Indexando...";
+      if (p.total_chunks > 0) {
+        const pct = Math.round((p.chunks_processados / p.total_chunks) * 100);
+        texto += ` (${p.chunks_processados}/${p.total_chunks} trechos, ${pct}%)`;
+      }
+      indexStatusEl.textContent = texto;
+    } catch (err) {
+      // backend pode estar momentaneamente ocupado processando — ignora e tenta na próxima
+    }
+  }, 1200);
+}
+
 indexBtn.addEventListener("click", async () => {
-  if (selectedFiles.length === 0) return;
+  const link = urlInput.value.trim();
+  if (selectedFiles.length === 0 && !link) return;
 
   indexBtn.disabled = true;
   indexBtn.textContent = "Indexando...";
   indexStatusEl.className = "index-status";
-  indexStatusEl.textContent = "Lendo e indexando os PDFs. Isso pode levar alguns instantes em arquivos grandes...";
+  indexStatusEl.textContent = "Lendo o conteúdo...";
+  iniciarPollingDeProgresso();
 
   const formData = new FormData();
   selectedFiles.forEach(f => formData.append("files", f));
+  if (link) formData.append("url", link);
 
   try {
     const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
     const data = await res.json();
 
-    if (!res.ok) throw new Error(data.detail || "Falha ao indexar os PDFs.");
+    if (!res.ok) throw new Error(data.detail || "Falha ao indexar.");
 
     indexStatusEl.className = "index-status ok";
-    indexStatusEl.textContent = `✓ ${data.arquivos.length} arquivo(s) indexado(s), ${data.total_chunks} trechos gerados.`;
+    indexStatusEl.textContent = `✓ ${data.arquivos.length} item(ns) indexado(s), ${data.total_chunks} trechos gerados.`;
     if (resetBtn) resetBtn.style.display = "block";
 
     chatInput.disabled = false;
     sendBtn.disabled = false;
     chatInput.focus();
 
-    addMessage("system", "Documentos indexados. Pode perguntar!");
+    addMessage("system", "Conteúdo indexado. Pode perguntar!");
   } catch (err) {
     indexStatusEl.className = "index-status error";
     indexStatusEl.textContent = `Erro: ${err.message}`;
   } finally {
-    indexBtn.disabled = false;
+    pararPolling();
+    atualizarEstadoBotaoIndexar();
     indexBtn.textContent = "Indexar documentos";
   }
 });
 
 // ---------- Chat ----------
+
+// Guarda as últimas trocas da conversa, para o backend poder entender
+// perguntas de acompanhamento (ex: "e sobre isso?").
+let conversationHistory = [];
+const MAX_HISTORICO = 4;
 
 chatForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -163,12 +218,19 @@ chatForm.addEventListener("submit", async (e) => {
     const res = await fetch(`${API_URL}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pergunta }),
+      body: JSON.stringify({ pergunta, historico: conversationHistory }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Erro ao consultar o agente.");
 
     updateMessage(thinkingId, data.resposta, data.acao_final, data.citacoes);
+
+    if (data.acao_final === "AUTO_RESOLVER") {
+      conversationHistory.push({ pergunta, resposta: data.resposta });
+      if (conversationHistory.length > MAX_HISTORICO) {
+        conversationHistory = conversationHistory.slice(-MAX_HISTORICO);
+      }
+    }
   } catch (err) {
     updateMessage(thinkingId, `Erro: ${err.message}`, null, []);
   } finally {

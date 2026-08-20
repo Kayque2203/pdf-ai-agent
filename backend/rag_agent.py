@@ -18,13 +18,34 @@ from typing import TypedDict, Optional, List, Dict, Literal
 
 # --- Certificado corporativo (redes com proxy/firewall que inspeciona HTTPS) ---
 # Precisa ser configurado ANTES de importar qualquer coisa relacionada a
-# grpc/google, senão a biblioteca já carrega sua lista de certificados padrão
-# e ignora essa configuração.
+# grpc/google/requests, senão a biblioteca já carrega sua lista de
+# certificados padrão e ignora essa configuração.
+#
+# O gRPC (usado nas chamadas reais de embedding/chat do Gemini) se mostrou
+# confiável usando o arquivo combined_cert.pem gerado manualmente (ver
+# README). Priorizamos ele aqui; se não existir, caímos para o certifi.
 _CERT_PATH = Path(__file__).resolve().parent / "combined_cert.pem"
-if _CERT_PATH.exists():
+if not _CERT_PATH.exists():
+    try:
+        import certifi
+        _CERT_PATH = Path(certifi.where())
+    except ImportError:
+        _CERT_PATH = None
+
+if _CERT_PATH:
     os.environ["SSL_CERT_FILE"] = str(_CERT_PATH)
     os.environ["REQUESTS_CA_BUNDLE"] = str(_CERT_PATH)
     os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = str(_CERT_PATH)
+
+# A biblioteca `requests` (usada para ler links da web) costuma ser mais
+# rígida que o gRPC na validação do certificado da empresa. O pacote abaixo
+# faz o Python confiar diretamente no repositório de certificados do
+# Windows (o mesmo que o navegador já usa) especificamente para `requests`,
+# independente do arquivo de certificado usado acima.
+try:
+    import pip_system_certs.wrapt_requests  # noqa: F401
+except ImportError:
+    pass
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -33,7 +54,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_community.document_loaders import PyMuPDFLoader, Docx2txtLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -111,8 +132,12 @@ prompt_rag = ChatPromptTemplate.from_messages([
      "NÃO use markdown: não use asteriscos, negrito, títulos ou listas com marcadores — "
      "escreva em texto corrido, como se estivesse falando com a pessoa. "
      "Cite a seção ou o requisito relevante de forma natural dentro do texto, sem formatação especial. "
+     "Use o histórico da conversa apenas para entender do que a pergunta atual está falando "
+     "(ex: 'e o de rede?' referindo-se a um assunto mencionado antes) — mas responda sempre "
+     "com base no contexto do documento, nunca inventando algo a partir do histórico. "
      "Se não houver base suficiente no contexto para responder com segurança, responda apenas 'Não sei'."),
-    ("human", "Pergunta: {input}\n\nContexto:\n{context}"),
+    ("human",
+     "{historico}Pergunta atual: {input}\n\nContexto do documento:\n{context}"),
 ])
 
 document_chain = create_stuff_documents_chain(llm_triagem, prompt_rag)
@@ -211,40 +236,135 @@ def _extrair_tempo_espera(erro: Exception) -> float:
     return 30.0  # fallback se não conseguir extrair
 
 
-def indexar_pdfs(caminhos: List[Path]) -> dict:
-    """Carrega os PDFs informados, gera embeddings e (re)constrói o índice FAISS."""
+# Estado do progresso da indexação em andamento, consultado pelo frontend
+# via GET /upload-progress enquanto o POST /upload está rodando.
+_progresso = {
+    "em_andamento": False,
+    "lote_atual": 0,
+    "total_lotes": 0,
+    "chunks_processados": 0,
+    "total_chunks": 0,
+    "aguardando_segundos": None,
+    "mensagem": "",
+}
+
+
+def obter_progresso() -> dict:
+    return dict(_progresso)
+
+
+def _resetar_progresso():
+    _progresso.update({
+        "em_andamento": False,
+        "lote_atual": 0,
+        "total_lotes": 0,
+        "chunks_processados": 0,
+        "total_chunks": 0,
+        "aguardando_segundos": None,
+        "mensagem": "",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Leitura de diferentes tipos de arquivo e de links
+# ---------------------------------------------------------------------------
+
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".xlsx", ".xls"}
+
+
+def _carregar_arquivo(caminho: Path) -> List[Document]:
+    """Carrega um arquivo e retorna seus documentos, de acordo com a extensão."""
+    ext = caminho.suffix.lower()
+
+    if ext == ".pdf":
+        return PyMuPDFLoader(str(caminho)).load()
+
+    if ext == ".docx":
+        return Docx2txtLoader(str(caminho)).load()
+
+    if ext in (".txt", ".md"):
+        texto = caminho.read_text(encoding="utf-8", errors="ignore")
+        return [Document(page_content=texto, metadata={"source": str(caminho), "page": 0})]
+
+    if ext == ".csv":
+        import csv
+        with open(caminho, newline="", encoding="utf-8", errors="ignore") as f:
+            linhas = [" | ".join(linha) for linha in csv.reader(f)]
+        texto = "\n".join(linhas)
+        return [Document(page_content=texto, metadata={"source": str(caminho), "page": 0})]
+
+    if ext in (".xlsx", ".xls"):
+        import openpyxl
+        wb = openpyxl.load_workbook(str(caminho), data_only=True)
+        docs = []
+        for idx, planilha in enumerate(wb.worksheets):
+            linhas = []
+            for linha in planilha.iter_rows(values_only=True):
+                linhas.append(" | ".join("" if c is None else str(c) for c in linha))
+            texto = f"[Planilha: {planilha.title}]\n" + "\n".join(linhas)
+            docs.append(Document(page_content=texto, metadata={"source": str(caminho), "page": idx}))
+        return docs
+
+    raise ValueError(f"Tipo de arquivo não suportado: {ext}")
+
+
+def _carregar_url(url: str) -> List[Document]:
+    """Baixa uma página web e extrai o texto principal dela."""
+    import requests
+    from bs4 import BeautifulSoup
+
+    resposta = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    resposta.raise_for_status()
+
+    sopa = BeautifulSoup(resposta.text, "html.parser")
+    for tag in sopa(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
+
+    texto = re.sub(r"\n{3,}", "\n\n", sopa.get_text(separator="\n")).strip()
+    if not texto:
+        raise ValueError("Não foi possível extrair texto dessa página.")
+
+    return [Document(page_content=texto, metadata={"source": url, "page": 0})]
+
+
+def _chunk_e_indexar(docs: List[Document], carregados: List[dict], nomes_indexados: List[str]) -> dict:
+    """Recebe documentos já carregados, quebra em chunks e gera o índice FAISS
+    em lotes (com retry automático em caso de limite de requisições)."""
     global _retriever, _indexed_files
 
-    docs = []
-    carregados = []
-    for caminho in caminhos:
-        try:
-            loader = PyMuPDFLoader(str(caminho))
-            paginas = loader.load()
-            docs.extend(paginas)
-            carregados.append({"arquivo": caminho.name, "paginas": len(paginas)})
-        except Exception as e:
-            carregados.append({"arquivo": caminho.name, "erro": str(e)})
-
     if not docs:
-        return {"ok": False, "detalhe": "Nenhum PDF pôde ser lido.", "arquivos": carregados}
+        _resetar_progresso()
+        erros = [f"{c['arquivo']}: {c['erro']}" for c in carregados if c.get("erro")]
+        detalhe = "Nenhum conteúdo pôde ser extraído."
+        if erros:
+            detalhe += " Detalhes: " + " | ".join(erros)
+        return {"ok": False, "detalhe": detalhe, "arquivos": carregados}
+
+    _progresso["mensagem"] = "Preparando o conteúdo..."
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1800, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
     chunks = [d for d in chunks if isinstance(d, Document)]
 
-    # Gera embeddings em lotes pequenos. Se a API reclamar de limite de
-    # requisições (erro 429), espera o tempo sugerido por ela e tenta de
-    # novo em vez de desistir — comum em PDFs grandes na camada gratuita.
     TAMANHO_LOTE = 80
     MAX_TENTATIVAS_POR_LOTE = 6
     vectorstore = None
     total = len(chunks)
+    total_lotes = (total + TAMANHO_LOTE - 1) // TAMANHO_LOTE
+
+    _progresso["total_chunks"] = total
+    _progresso["total_lotes"] = total_lotes
+    _progresso["mensagem"] = f"Gerando embeddings de {total} trechos..."
 
     try:
         for i in range(0, total, TAMANHO_LOTE):
             lote = chunks[i : i + TAMANHO_LOTE]
+            lote_num = i // TAMANHO_LOTE + 1
             print(f"[DEBUG] indexando lote {i}-{i+len(lote)} de {total} chunks...")
+
+            _progresso["lote_atual"] = lote_num
+            _progresso["aguardando_segundos"] = None
+            _progresso["mensagem"] = f"Processando lote {lote_num} de {total_lotes}..."
 
             tentativa = 0
             while True:
@@ -264,23 +384,32 @@ def indexar_pdfs(caminhos: List[Path]) -> dict:
                         f"[DEBUG] Limite de requisições atingido. Aguardando "
                         f"{espera:.0f}s antes de tentar de novo (tentativa {tentativa})..."
                     )
+                    _progresso["aguardando_segundos"] = round(espera)
+                    _progresso["mensagem"] = (
+                        f"Limite da API atingido, aguardando {round(espera)}s "
+                        f"(lote {lote_num} de {total_lotes})..."
+                    )
                     time.sleep(espera)
+
+            _progresso["chunks_processados"] = min(i + TAMANHO_LOTE, total)
 
             if i + TAMANHO_LOTE < total:
                 time.sleep(2)
     except Exception as e:
+        _resetar_progresso()
         return {
             "ok": False,
             "detalhe": (
                 f"Falha ao gerar embeddings ({e.__class__.__name__}: {e}). "
-                f"Tente novamente em alguns instantes ou envie o PDF em partes menores."
+                f"Tente novamente em alguns instantes ou envie o conteúdo em partes menores."
             ),
             "arquivos": carregados,
         }
 
     _retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
-    _indexed_files = [c.name for c in caminhos]
+    _indexed_files = nomes_indexados
     _salvar_indice(vectorstore, _indexed_files)
+    _resetar_progresso()
 
     contagem = Counter(pathlib.Path(d.metadata.get("source", "")).name for d in chunks)
 
@@ -292,7 +421,59 @@ def indexar_pdfs(caminhos: List[Path]) -> dict:
     }
 
 
-def perguntar_rag(pergunta: str) -> Dict:
+def indexar_fontes(caminhos: List[Path], urls: Optional[List[str]] = None) -> dict:
+    """Carrega arquivos (PDF/DOCX/TXT/MD/CSV/XLSX) e/ou links da web informados,
+    gera embeddings e (re)constrói o índice FAISS."""
+    _resetar_progresso()
+    _progresso["em_andamento"] = True
+    _progresso["mensagem"] = "Lendo os arquivos..."
+
+    docs: List[Document] = []
+    carregados: List[dict] = []
+    nomes: List[str] = []
+
+    for caminho in caminhos:
+        try:
+            novos = _carregar_arquivo(caminho)
+            docs.extend(novos)
+            carregados.append({"arquivo": caminho.name, "paginas": len(novos)})
+            nomes.append(caminho.name)
+        except Exception as e:
+            carregados.append({"arquivo": caminho.name, "erro": str(e)})
+
+    for url in (urls or []):
+        if not url or not url.strip():
+            continue
+        url = url.strip()
+        try:
+            novos = _carregar_url(url)
+            docs.extend(novos)
+            carregados.append({"arquivo": url, "paginas": len(novos)})
+            nomes.append(url)
+        except Exception as e:
+            carregados.append({"arquivo": url, "erro": str(e)})
+
+    return _chunk_e_indexar(docs, carregados, nomes)
+
+
+def _formatar_historico(historico: Optional[List[Dict[str, str]]]) -> str:
+    """Formata os últimos turnos da conversa para dar contexto em perguntas de
+    acompanhamento (ex: 'e sobre isso?'). Limitado às últimas 3 trocas para
+    não inflar o prompt (e a cota) sem necessidade."""
+    if not historico:
+        return ""
+    trechos = []
+    for turno in historico[-3:]:
+        pergunta_ant = (turno.get("pergunta") or "").strip()
+        resposta_ant = (turno.get("resposta") or "").strip()
+        if pergunta_ant and resposta_ant:
+            trechos.append(f"Usuário: {pergunta_ant}\nAssistente: {resposta_ant}")
+    if not trechos:
+        return ""
+    return "Histórico recente da conversa:\n" + "\n\n".join(trechos) + "\n\n"
+
+
+def perguntar_rag(pergunta: str, historico: Optional[List[Dict[str, str]]] = None) -> Dict:
     if _retriever is None:
         return {
             "answer": "Nenhum PDF foi indexado ainda. Envie um PDF em /upload antes de perguntar.",
@@ -300,14 +481,28 @@ def perguntar_rag(pergunta: str) -> Dict:
             "contexto_encontrado": False,
         }
 
-    docs_relacionados = _retriever.invoke(pergunta)
+    # Para a busca no PDF, combina a pergunta atual com a última pergunta do
+    # histórico (se houver) — ajuda a achar o trecho certo quando a pergunta
+    # atual é vaga tipo "e sobre isso?".
+    pergunta_busca = pergunta
+    if historico:
+        ultima = (historico[-1].get("pergunta") or "").strip()
+        if ultima:
+            pergunta_busca = f"{ultima} {pergunta}"
+
+    docs_relacionados = _retriever.invoke(pergunta_busca)
     print(f"[DEBUG] docs encontrados: {len(docs_relacionados)}")
 
     if not docs_relacionados:
         print("[DEBUG] Nenhum doc encontrado, retornando Não sei.")
         return {"answer": "Não sei.", "citacoes": [], "contexto_encontrado": False}
 
-    answer = document_chain.invoke({"input": pergunta, "context": docs_relacionados})
+    historico_formatado = _formatar_historico(historico)
+    answer = document_chain.invoke({
+        "input": pergunta,
+        "context": docs_relacionados,
+        "historico": historico_formatado,
+    })
     txt = (answer or "").strip()
     print(f"[DEBUG] resposta da IA (bruta): {txt!r}")
 
@@ -337,19 +532,15 @@ _carregar_indice_salvo()
 
 class AgentState(TypedDict, total=False):
     pergunta: str
-    triagem: dict
+    historico: List[Dict[str, str]]
     resposta: Optional[str]
     citacoes: List[dict]
     rag_sucesso: bool
     acao_final: str
 
 
-def node_triagem(state: AgentState) -> AgentState:
-    return {"triagem": triagem(state["pergunta"])}
-
-
 def node_auto_resolver(state: AgentState) -> AgentState:
-    resposta_rag = perguntar_rag(state["pergunta"])
+    resposta_rag = perguntar_rag(state["pergunta"], state.get("historico"))
     if resposta_rag["contexto_encontrado"]:
         return {
             "resposta": resposta_rag["answer"],
@@ -380,9 +571,14 @@ _workflow.add_edge("auto_resolver", END)
 grafo = _workflow.compile()
 
 
-def perguntar_agente(pergunta: str) -> dict:
-    """Ponto de entrada único usado pela API: roda o RAG e retorna a resposta."""
-    resultado = grafo.invoke({"pergunta": pergunta})
+def perguntar_agente(pergunta: str, historico: Optional[List[Dict[str, str]]] = None) -> dict:
+    """Ponto de entrada único usado pela API: roda o RAG e retorna a resposta.
+
+    `historico` (opcional) é uma lista de trocas anteriores da conversa, no
+    formato [{"pergunta": "...", "resposta": "..."}], usada para dar
+    contexto a perguntas de acompanhamento.
+    """
+    resultado = grafo.invoke({"pergunta": pergunta, "historico": historico or []})
     return {
         "resposta": resultado.get("resposta"),
         "citacoes": resultado.get("citacoes", []),

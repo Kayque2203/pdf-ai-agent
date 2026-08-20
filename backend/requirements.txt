@@ -11,3 +11,8 @@ langgraph
 faiss-cpu
 pymupdf
 pydantic
+docx2txt
+openpyxl
+beautifulsoup4
+requests
+pip-system-certs

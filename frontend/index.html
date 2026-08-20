@@ -15,22 +15,26 @@
       <span class="brand-mark">§</span>
       <div>
         <h1>Agente de Documentos</h1>
-        <p class="subtitle">Envie um PDF e converse com ele</p>
+        <p class="subtitle">Envie arquivos ou um link e converse com eles</p>
       </div>
     </div>
 
     <label class="dropzone" id="dropzone" for="file-input">
-      <input type="file" id="file-input" accept="application/pdf" multiple hidden>
+      <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md,.csv,.xlsx,.xls" multiple hidden>
       <span class="dropzone-icon">⇧</span>
-      <span class="dropzone-text">Solte PDFs aqui ou clique para escolher</span>
-      <span class="dropzone-hint">Aceita vários arquivos · qualquer tamanho</span>
+      <span class="dropzone-text">Solte arquivos aqui ou clique para escolher</span>
+      <span class="dropzone-hint">PDF · Word · Excel · CSV · TXT · MD</span>
     </label>
+
+    <div class="url-input-row">
+      <input type="url" id="url-input" placeholder="ou cole um link (https://...)">
+    </div>
 
     <button id="index-btn" class="btn-primary" disabled>Indexar documentos</button>
 
     <div id="file-list" class="file-list"></div>
 
-    <button id="reset-btn" class="btn-secondary" style="display:none;">Esquecer PDF atual</button>
+    <button id="reset-btn" class="btn-secondary" style="display:none;">Esquecer conteúdo atual</button>
 
     <div id="index-status" class="index-status"></div>
   </aside>
@@ -38,8 +42,8 @@
   <main class="panel panel-chat">
     <div id="messages" class="messages">
       <div class="message message-system">
-        Envie um ou mais PDFs ao lado e clique em <strong>Indexar documentos</strong>.
-        Depois, pergunte qualquer coisa sobre o conteúdo aqui.
+        Envie arquivos (PDF, Word, Excel, CSV, TXT, MD) ou cole um link ao lado, e clique em
+        <strong>Indexar documentos</strong>. Depois, pergunte qualquer coisa sobre o conteúdo aqui.
       </div>
     </div>
 
